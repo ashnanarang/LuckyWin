@@ -66,7 +66,7 @@ def register():
         return jsonify(error="Please enter a valid age."), 400
     if not 1 <= age <= 120:
         return jsonify(error="Please enter an age from 1 to 120."), 400
-    if counter_number and (len(counter_number) > 32 or not re.fullmatch(r"[\\w-]+", counter_number, flags=re.ASCII)):
+    if counter_number and (len(counter_number) > 32 or not re.fullmatch(r"[\w-]+", counter_number, flags=re.ASCII)):
         return jsonify(error="Please enter a valid counter number."), 400
 
     db = get_db_connection()
