@@ -1,6 +1,8 @@
 import os
 import re
+import secrets
 import uuid
+from datetime import datetime, timezone
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -16,7 +18,7 @@ app.secret_key = os.getenv("SECRET_KEY")
 
 # Comma-separated list of allowed frontend origins, e.g. https://your-site.netlify.app
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("FRONTEND_ORIGINS", "http://localhost:8888").split(",") if o.strip()]
-CORS(app, origins=ALLOWED_ORIGINS, allow_headers=["Content-Type", "Authorization"])
+CORS(app, origins=ALLOWED_ORIGINS, allow_headers=["Content-Type", "Authorization", "Idempotency-Key"])
 
 TOKEN_MAX_AGE = 60 * 60 * 8  # admin session lasts 8 hours
 serializer = URLSafeTimedSerializer(app.secret_key or "dev-only-secret", salt="admin-token")
@@ -121,6 +123,117 @@ def admin_participants():
         p["created_at"] = p["created_at"].isoformat() if p["created_at"] else None
 
     return jsonify(participants=participants)
+
+
+@app.route("/api/admin/participants/count")
+def admin_participant_count():
+    if not is_admin():
+        return jsonify(error="Unauthorized"), 401
+    db = get_db_connection()
+    cursor = db.cursor()
+    try:
+        cursor.execute("SELECT COUNT(*) AS total FROM participants")
+        total = cursor.fetchone()["total"]
+    finally:
+        cursor.close()
+        db.close()
+    return jsonify(eligible_count=total)
+
+
+def create_draw(draw_type, winners):
+    created_at = datetime.now(timezone.utc).isoformat()
+    return {
+        "id": str(uuid.uuid4()),
+        "draw_type": draw_type,
+        "status": "completed",
+        "winner_count": len(winners),
+        "created_at": created_at,
+        "winners": winners,
+    }
+
+
+@app.route("/api/admin/draws/random", methods=["POST"])
+def random_draw():
+    if not is_admin():
+        return jsonify(error="Unauthorized"), 401
+    payload = request.get_json(silent=True) or {}
+    try:
+        count = int(payload.get("count"))
+    except (TypeError, ValueError):
+        return jsonify(error="Enter a valid winner count."), 400
+    if count < 1 or count > 500:
+        return jsonify(error="Winner count must be between 1 and 500."), 400
+
+    db = get_db_connection()
+    cursor = db.cursor()
+    try:
+        cursor.execute("SELECT id, name, age, ticket_number FROM participants ORDER BY id")
+        participants = cursor.fetchall()
+    finally:
+        cursor.close()
+        db.close()
+
+    if count > len(participants):
+        return jsonify(error="There are not enough registered participants."), 400
+
+    selected = secrets.SystemRandom().sample(participants, count)
+    winners = [{
+        "id": person["id"],
+        "name": person["name"],
+        "age": person["age"],
+        "ticket_number": person["ticket_number"],
+        "counter_number": None,
+    } for person in selected]
+    return jsonify(draw=create_draw("random", winners))
+
+
+@app.route("/api/admin/draws/manual", methods=["POST"])
+def manual_draw():
+    if not is_admin():
+        return jsonify(error="Unauthorized"), 401
+    payload = request.get_json(silent=True) or {}
+    raw_ids = payload.get("participant_ids")
+    if not isinstance(raw_ids, list) or not 1 <= len(raw_ids) <= 500:
+        return jsonify(error="Select between 1 and 500 participants."), 400
+    try:
+        ids = [int(value) for value in raw_ids]
+    except (TypeError, ValueError):
+        return jsonify(error="Invalid participant selection."), 400
+    if len(set(ids)) != len(ids):
+        return jsonify(error="A participant can only be selected once."), 400
+
+    db = get_db_connection()
+    cursor = db.cursor()
+    try:
+        cursor.execute(
+            "SELECT id, name, age, ticket_number FROM participants WHERE id = ANY(%s)",
+            (ids,),
+        )
+        found = cursor.fetchall()
+    finally:
+        cursor.close()
+        db.close()
+
+    by_id = {person["id"]: person for person in found}
+    if len(by_id) != len(ids):
+        return jsonify(error="One or more selected participants no longer exist."), 400
+    winners = [{
+        "id": by_id[person_id]["id"],
+        "name": by_id[person_id]["name"],
+        "age": by_id[person_id]["age"],
+        "ticket_number": by_id[person_id]["ticket_number"],
+        "counter_number": None,
+    } for person_id in ids]
+    return jsonify(draw=create_draw("manual", winners))
+
+
+@app.route("/api/admin/draws", methods=["GET"])
+def draw_history_unavailable():
+    if not is_admin():
+        return jsonify(error="Unauthorized"), 401
+    # Draw results are kept in the admin's browser because this legacy production
+    # database has no draw-history table. This route intentionally does not write.
+    return jsonify(draws=[], total=0, page=1, pages=1)
 
 
 if __name__ == "__main__":
